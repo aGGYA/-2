@@ -1,0 +1,130 @@
+#define PERIOD_US 1000
+
+const int PIN_LED = 7;
+const int LED_ON  = LOW;
+const int LED_OFF = HIGH;
+
+const unsigned int ON_OVERHEAD_US  = 3;
+const unsigned int OFF_OVERHEAD_US = 9;
+
+const unsigned long STEP_US = 5000;
+
+int g_period = PERIOD_US;
+int g_duty   = 0;
+unsigned int g_on_delay  = 0;
+unsigned int g_off_delay = 0;
+
+void update_delays() {
+  unsigned int on_us = (unsigned long)g_period * g_duty / 100;
+  unsigned int total = g_period - ON_OVERHEAD_US - OFF_OVERHEAD_US;
+
+  g_on_delay = (on_us > ON_OVERHEAD_US) ? on_us - ON_OVERHEAD_US : 0;
+  if (g_on_delay > total) g_on_delay = total;
+  g_off_delay = total - g_on_delay;
+}
+
+void set_period(int period) {
+  g_period = constrain(period, 100, 10000);
+  update_delays();
+}
+
+void set_duty(int duty) {
+  g_duty = constrain(duty, 0, 100);
+  update_delays();
+}
+
+void pwm_output() {
+  if (g_duty > 0) {
+    digitalWrite(PIN_LED, LED_ON);
+    delayMicroseconds(g_on_delay);
+  }
+  if (g_duty < 100) {
+    digitalWrite(PIN_LED, LED_OFF);
+    delayMicroseconds(g_off_delay);
+  }
+}
+
+int duty_now = 0;
+int dir      = +1;
+unsigned long next_step_us;
+
+unsigned long cycle_count = 0;
+unsigned long measure_start;
+
+void print_status() {
+  unsigned long now = micros();
+  float measured = (float)(now - measure_start) / cycle_count;
+  Serial.print(F("period set="));
+  Serial.print(g_period);
+  Serial.print(F("us  measured="));
+  Serial.print(measured, 1);
+  Serial.print(F("us  cycles/s="));
+  Serial.println(cycle_count);
+  cycle_count = 0;
+  measure_start = micros();
+}
+
+void check_serial() {
+  static long value = 0;
+  static bool has_digit = false;
+  static byte idle_steps = 0;
+  bool done = false;
+
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    idle_steps = 0;
+    if (c >= '0' && c <= '9') {
+      if (value < 100000) value = value * 10 + (c - '0');
+      has_digit = true;
+    } else if (has_digit) {
+      done = true;
+      break;
+    }
+  }
+  if (has_digit && !done && ++idle_steps >= 20) done = true;
+  if (!done) return;
+
+  set_period((int)constrain(value, 100, 10000));
+  set_duty(duty_now);
+  Serial.print(F(">> period changed to "));
+  Serial.print(g_period);
+  Serial.println(F(" us"));
+  value = 0;
+  has_digit = false;
+  cycle_count = 0;
+  measure_start = micros();
+}
+
+void setup() {
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LED_OFF);
+
+  Serial.begin(115200);
+  Serial.println(F("Challenge 2: PWM with digitalWrite + delayMicroseconds"));
+  Serial.println(F("Type 10000, 1000 or 100 to change the period (us)."));
+
+  set_period(PERIOD_US);
+  set_duty(0);
+
+  next_step_us  = micros() + STEP_US;
+  measure_start = micros();
+}
+
+void loop() {
+  pwm_output();
+  cycle_count++;
+
+  if ((long)(micros() - next_step_us) >= 0) {
+    bool one_second = false;
+    do {
+      next_step_us += STEP_US;
+      duty_now += dir;
+      if (duty_now >= 100) { duty_now = 100; dir = -1; }
+      if (duty_now <= 0)   { duty_now = 0;   dir = +1; one_second = true; }
+    } while ((long)(micros() - next_step_us) >= 0);
+
+    set_duty(duty_now);
+    check_serial();
+    if (one_second) print_status();
+  }
+}
