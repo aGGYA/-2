@@ -1,0 +1,159 @@
+#include <Servo.h>
+#include <math.h>
+
+#define PIN_LED   9
+#define PIN_SERVO 10
+#define PIN_TRIG  12
+#define PIN_ECHO  13
+
+#define LED_ON  1
+#define LED_OFF 0
+
+#define SND_VEL 346.0
+#define INTERVAL 25
+#define PULSE_DURATION 10
+#define _DIST_MIN 20.0
+#define _DIST_MAX 400.0
+
+#define TIMEOUT ((INTERVAL / 2) * 1000.0)
+#define SCALE (0.001 * 0.5 * SND_VEL)
+
+#define _EMA_ALPHA 0.5
+
+#define _DIST_DETECT 150.0
+#define HOLD_TIME 1000
+
+#define _DUTY_MIN 1000
+#define _DUTY_MAX 2000
+
+#define ANGLE_CLOSE 120.0
+#define ANGLE_OPEN  00.0
+
+#define MOVING_TIME 2000
+
+#define FUNC_SIGMOID 1
+#define FUNC_COSINE  2
+#define SMOOTH_FUNC  FUNC_SIGMOID
+
+#define SIGMOID_K 10.0
+
+Servo myservo;
+
+float dist_ema = _DIST_MAX;
+unsigned long last_sampling_time;
+unsigned long last_detect_time;
+bool gate_open = false;
+
+float cur_angle = ANGLE_CLOSE;
+float start_angle = ANGLE_CLOSE;
+float target_angle = ANGLE_CLOSE;
+unsigned long move_start_time;
+unsigned long move_duration = 0;
+
+float USS_measure(int TRIG, int ECHO);
+
+float smooth_sigmoid(float t) {
+  float lo = 1.0 / (1.0 + exp(SIGMOID_K * 0.5));
+  float hi = 1.0 / (1.0 + exp(-SIGMOID_K * 0.5));
+  float s  = 1.0 / (1.0 + exp(-SIGMOID_K * (t - 0.5)));
+  return (s - lo) / (hi - lo);
+}
+
+float smooth_cosine(float t) {
+  return 0.5 - 0.5 * cos(PI * t);
+}
+
+float smooth(float t) {
+  if (SMOOTH_FUNC == FUNC_SIGMOID)
+    return smooth_sigmoid(t);
+  return smooth_cosine(t);
+}
+
+int angle_to_duty(float angle) {
+  return _DUTY_MIN + angle * (_DUTY_MAX - _DUTY_MIN) / 180.0;
+}
+
+void start_move(float target) {
+  start_angle = cur_angle;
+  target_angle = target;
+  move_duration = MOVING_TIME * fabs(target_angle - start_angle) / fabs(ANGLE_OPEN - ANGLE_CLOSE);
+  move_start_time = millis();
+}
+
+void update_servo() {
+  unsigned long progress = millis() - move_start_time;
+
+  if (move_duration == 0 || progress >= move_duration) {
+    cur_angle = target_angle;
+  } else {
+    float t = (float)progress / move_duration;
+    cur_angle = start_angle + (target_angle - start_angle) * smooth(t);
+  }
+  myservo.writeMicroseconds(angle_to_duty(cur_angle));
+}
+
+void setup() {
+  pinMode(PIN_LED, OUTPUT);
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+  digitalWrite(PIN_LED, LED_OFF);
+
+  myservo.attach(PIN_SERVO);
+  myservo.writeMicroseconds(angle_to_duty(ANGLE_CLOSE));
+
+  Serial.begin(57600);
+
+  last_sampling_time = millis();
+}
+
+void loop() {
+  update_servo();
+
+  if (millis() - last_sampling_time < INTERVAL)
+    return;
+  last_sampling_time += INTERVAL;
+
+  float dist_raw = USS_measure(PIN_TRIG, PIN_ECHO);
+  float dist_filtered;
+
+  if ((dist_raw == 0.0) || (dist_raw > _DIST_MAX))
+    dist_filtered = _DIST_MAX;
+  else if (dist_raw < _DIST_MIN)
+    dist_filtered = _DIST_MIN;
+  else
+    dist_filtered = dist_raw;
+
+  dist_ema = _EMA_ALPHA * dist_filtered + (1 - _EMA_ALPHA) * dist_ema;
+
+  bool car_detected = (dist_ema < _DIST_DETECT);
+  bool want_open = gate_open;
+
+  if (car_detected) {
+    last_detect_time = millis();
+    want_open = true;
+  } else if (gate_open && millis() - last_detect_time >= HOLD_TIME) {
+    want_open = false;
+  }
+
+  if (want_open != gate_open) {
+    gate_open = want_open;
+    start_move(gate_open ? ANGLE_OPEN : ANGLE_CLOSE);
+  }
+
+  digitalWrite(PIN_LED, gate_open ? LED_ON : LED_OFF);
+
+  Serial.print("Detect:"); Serial.print(_DIST_DETECT);
+  Serial.print(",dist:");  Serial.print(dist_ema);
+  Serial.print(",angle:"); Serial.print(cur_angle);
+  Serial.print(",Max:");   Serial.print(_DIST_MAX);
+  Serial.println("");
+}
+
+float USS_measure(int TRIG, int ECHO) {
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(PULSE_DURATION);
+  digitalWrite(TRIG, LOW);
+
+  return pulseIn(ECHO, HIGH, TIMEOUT) * SCALE;
+}
