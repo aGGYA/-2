@@ -1,0 +1,267 @@
+#include <Servo.h>
+#include <EEPROM.h>
+
+#define PIN_LED   9
+#define PIN_SERVO 10
+
+#define LED_ON  1
+#define LED_OFF 0
+
+#define _DUTY_MIN_DEFAULT 544
+#define _DUTY_MAX_DEFAULT 2400
+#define _DUTY_LIMIT_LOW   500
+#define _DUTY_LIMIT_HIGH  2500
+
+#define _SERVO_SPEED_1 3.0
+#define _ANGLE_START_1 0.0
+#define _ANGLE_END_1   180.0
+
+#define _SERVO_SPEED_2 0.3
+#define _ANGLE_START_2 0.0
+#define _ANGLE_END_2   90.0
+
+#define _WAIT_TIME 3000
+
+#define _INTERVAL_SERVO  20
+#define _INTERVAL_SERIAL 500
+
+#define EEPROM_MAGIC 0x13C2
+
+Servo myservo;
+
+int duty_min = _DUTY_MIN_DEFAULT;
+int duty_max = _DUTY_MAX_DEFAULT;
+
+float duty_curr;
+float duty_target;
+float duty_change_per_interval;
+float servo_speed;
+float angle_target;
+float elapsed_sec = 0;
+
+int phase = 0;
+unsigned long phase_start_time;
+
+unsigned long last_sampling_time_servo;
+unsigned long last_sampling_time_serial;
+bool event_servo, event_serial;
+
+int calib_step = 0;
+int calib_duty;
+long number = 0;
+bool has_number = false;
+unsigned long last_char_time;
+
+float angle_to_duty(float angle) {
+  return duty_min + (duty_max - duty_min) * angle / 180.0;
+}
+
+float duty_to_angle(float duty) {
+  return (duty - duty_min) * 180.0 / (duty_max - duty_min);
+}
+
+void write_servo() {
+  myservo.writeMicroseconds((int)(duty_curr + 0.5));
+}
+
+void load_calibration() {
+  int magic, mn, mx;
+  EEPROM.get(0, magic);
+  EEPROM.get(2, mn);
+  EEPROM.get(4, mx);
+  if (magic == EEPROM_MAGIC && mn >= _DUTY_LIMIT_LOW && mx <= _DUTY_LIMIT_HIGH && mn < mx) {
+    duty_min = mn;
+    duty_max = mx;
+  }
+}
+
+void save_calibration() {
+  EEPROM.put(0, (int)EEPROM_MAGIC);
+  EEPROM.put(2, duty_min);
+  EEPROM.put(4, duty_max);
+}
+
+void print_calibration() {
+  Serial.print("DUTY_MIN(0deg)=");    Serial.print(duty_min);
+  Serial.print(" DUTY_NEU(90deg)=");  Serial.print((duty_min + duty_max) / 2);
+  Serial.print(" DUTY_MAX(180deg)="); Serial.println(duty_max);
+}
+
+void ready_move(float speed, float angle_start, float angle_end) {
+  servo_speed = speed;
+  angle_target = angle_end;
+  duty_curr = angle_to_duty(angle_start);
+  duty_target = angle_to_duty(angle_end);
+  duty_change_per_interval = (duty_max - duty_min) * (servo_speed / 180.0) * (_INTERVAL_SERVO / 1000.0);
+  elapsed_sec = 0;
+  write_servo();
+  digitalWrite(PIN_LED, LED_OFF);
+  phase_start_time = millis();
+}
+
+void start_experiment() {
+  ready_move(_SERVO_SPEED_1, _ANGLE_START_1, _ANGLE_END_1);
+  phase = 0;
+  last_sampling_time_servo = millis();
+  last_sampling_time_serial = millis();
+}
+
+void set_calib_duty(long value) {
+  calib_duty = constrain(value, _DUTY_LIMIT_LOW, _DUTY_LIMIT_HIGH);
+  myservo.writeMicroseconds(calib_duty);
+  Serial.print("duty = ");
+  Serial.println(calib_duty);
+}
+
+void start_calibration() {
+  calib_step = 1;
+  digitalWrite(PIN_LED, LED_OFF);
+  Serial.println("==== CALIBRATION ====");
+  Serial.println("STEP 1: make the bar exactly 0 deg, then send m");
+  Serial.println("  + / - : 10us,  > / < : 1us,  number : set us,  q : cancel");
+  set_calib_duty(duty_min);
+}
+
+void apply_number() {
+  if (has_number) {
+    set_calib_duty(number);
+    number = 0;
+    has_number = false;
+  }
+}
+
+void handle_input() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (calib_step == 0) {
+      if (c == 'c' || c == 'C')
+        start_calibration();
+      continue;
+    }
+
+    last_char_time = millis();
+    if (c >= '0' && c <= '9') {
+      if (number < 10000) number = number * 10 + (c - '0');
+      has_number = true;
+      continue;
+    }
+    apply_number();
+
+    if (c == '+') set_calib_duty(calib_duty + 10);
+    else if (c == '-') set_calib_duty(calib_duty - 10);
+    else if (c == '>') set_calib_duty(calib_duty + 1);
+    else if (c == '<') set_calib_duty(calib_duty - 1);
+    else if ((c == 'm' || c == 'M') && calib_step == 1) {
+      duty_min = calib_duty;
+      calib_step = 2;
+      Serial.println("STEP 2: make the bar exactly 180 deg, then send x");
+      set_calib_duty(duty_max > duty_min ? duty_max : duty_min + 1000);
+    }
+    else if ((c == 'x' || c == 'X') && calib_step == 2) {
+      if (calib_duty <= duty_min + 100) {
+        Serial.println("180 deg duty must be larger than 0 deg duty. try again");
+      } else {
+        duty_max = calib_duty;
+        save_calibration();
+        Serial.println("==== SAVED (kept after power off) ====");
+        print_calibration();
+        calib_step = 0;
+        start_experiment();
+      }
+    }
+    else if (c == 'q' || c == 'Q') {
+      load_calibration();
+      Serial.println("calibration canceled");
+      calib_step = 0;
+      start_experiment();
+    }
+  }
+
+  if (has_number && millis() - last_char_time > 100)
+    apply_number();
+}
+
+void setup() {
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LED_OFF);
+
+  load_calibration();
+
+  myservo.attach(PIN_SERVO, _DUTY_LIMIT_LOW, _DUTY_LIMIT_HIGH);
+
+  Serial.begin(57600);
+  print_calibration();
+  Serial.println("send c to calibrate 0/180 deg");
+
+  start_experiment();
+}
+
+void loop() {
+  handle_input();
+  if (calib_step != 0)
+    return;
+
+  unsigned long time_curr = millis();
+
+  if (time_curr - last_sampling_time_servo >= _INTERVAL_SERVO) {
+    last_sampling_time_servo += _INTERVAL_SERVO;
+    event_servo = true;
+  }
+  if (time_curr - last_sampling_time_serial >= _INTERVAL_SERIAL) {
+    last_sampling_time_serial += _INTERVAL_SERIAL;
+    event_serial = true;
+  }
+
+  if (event_servo) {
+    event_servo = false;
+
+    if (phase == 0 || phase == 2 || phase == 3) {
+      if (millis() - phase_start_time >= _WAIT_TIME) {
+        if (phase == 2) {
+          ready_move(_SERVO_SPEED_2, _ANGLE_START_2, _ANGLE_END_2);
+          phase = 3;
+        } else {
+          phase = (phase == 0) ? 1 : 4;
+          phase_start_time = millis();
+          digitalWrite(PIN_LED, LED_ON);
+        }
+      }
+    } else if (phase == 1 || phase == 4) {
+      if (duty_target > duty_curr) {
+        duty_curr += duty_change_per_interval;
+        if (duty_curr > duty_target)
+          duty_curr = duty_target;
+      } else {
+        duty_curr -= duty_change_per_interval;
+        if (duty_curr < duty_target)
+          duty_curr = duty_target;
+      }
+      write_servo();
+
+      if (duty_curr == duty_target) {
+        elapsed_sec = (millis() - phase_start_time) / 1000.0;
+        digitalWrite(PIN_LED, LED_OFF);
+        phase = (phase == 1) ? 2 : 5;
+        phase_start_time = millis();
+      }
+    } else if (phase == 5) {
+      if (millis() - phase_start_time >= _WAIT_TIME)
+        start_experiment();
+    }
+  }
+
+  if (event_serial) {
+    event_serial = false;
+
+    if (phase == 1 || phase == 4)
+      elapsed_sec = (millis() - phase_start_time) / 1000.0;
+
+    Serial.print("Min:0,Max:180");
+    Serial.print(",Speed:");  Serial.print(servo_speed);
+    Serial.print(",Target:"); Serial.print(angle_target);
+    Serial.print(",Angle:");  Serial.print(duty_to_angle(duty_curr));
+    Serial.print(",Time:");   Serial.print(elapsed_sec);
+    Serial.println("");
+  }
+}
