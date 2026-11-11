@@ -1,0 +1,194 @@
+#include <Servo.h>
+#include <EEPROM.h>
+
+// Arduino pin assignment
+#define PIN_LED   9   // LED active-high (1: ON, 0: OFF)
+#define PIN_SERVO 10  // servo motor
+#define PIN_IR    0   // IR sensor at Pin A0
+
+#define LED_ON  1
+#define LED_OFF 0
+
+// configurable parameters
+#define _DIST_MIN 100.0   // minimum distance 10cm (unit: mm)
+#define _DIST_MAX 250.0   // maximum distance 25cm (unit: mm)
+
+#define _EMA_ALPHA 0.3    // EMA weight of new sample (range: 0 to 1)
+#define INTERVAL 30       // sampling interval (unit: msec), must be >= 20
+
+// default IR values at 10cm and 25cm (datasheet typical: 2.3V, 1.1V)
+// replaced by calibration: send '1' at 10cm, '2' at 25cm on serial monitor
+#define _IR_AT_DIST_MIN 470
+#define _IR_AT_DIST_MAX 225
+
+// duty duration for myservo.writeMicroseconds()
+#define _DUTY_MIN 544     // servo 0 degree
+#define _DUTY_NEU 1472    // servo 90 degree
+#define _DUTY_MAX 2400    // servo 180 degree
+
+// EEPROM address for IR calibration
+#define EEPROM_ADDR  16
+#define EEPROM_MAGIC 0x1714
+
+// global variables
+float dist_ema = _DIST_MIN;            // unit: mm
+int ir_cal_min = _IR_AT_DIST_MIN;      // IR value at 10cm
+int ir_cal_max = _IR_AT_DIST_MAX;      // IR value at 25cm
+float dist_cal_min, dist_cal_max;      // formula output at 10cm and 25cm
+unsigned long last_sampling_time;      // unit: msec
+unsigned long print_hold_until = 0;    // pause plot output to show messages
+
+Servo myservo;
+
+// distance formula given in the assignment (unit: mm)
+float ir_to_dist(float a_value) {
+  return (6762.0 / (a_value - 9) - 4.0) * 10.0 - 60.0;
+}
+
+// average of 32 readings for calibration
+int measure_ir() {
+  long sum = 0;
+  for (int i = 0; i < 32; i++) {
+    sum += analogRead(PIN_IR);
+    delay(2);
+  }
+  return sum / 32;
+}
+
+// use calibration values only if they are valid
+bool apply_calibration() {
+  if (ir_cal_min - ir_cal_max >= 50) {
+    dist_cal_min = ir_to_dist(ir_cal_min);
+    dist_cal_max = ir_to_dist(ir_cal_max);
+    return true;
+  }
+  dist_cal_min = ir_to_dist(_IR_AT_DIST_MIN);
+  dist_cal_max = ir_to_dist(_IR_AT_DIST_MAX);
+  return false;
+}
+
+void load_calibration() {
+  int magic, mn, mx;
+  EEPROM.get(EEPROM_ADDR, magic);
+  EEPROM.get(EEPROM_ADDR + 2, mn);
+  EEPROM.get(EEPROM_ADDR + 4, mx);
+  if (magic == EEPROM_MAGIC && mn <= 1023 && mx > 9 && mn - mx >= 50) {
+    ir_cal_min = mn;
+    ir_cal_max = mx;
+  }
+  apply_calibration();
+}
+
+void save_calibration() {
+  EEPROM.put(EEPROM_ADDR, (int)EEPROM_MAGIC);
+  EEPROM.put(EEPROM_ADDR + 2, ir_cal_min);
+  EEPROM.put(EEPROM_ADDR + 4, ir_cal_max);
+}
+
+void report_calibration() {
+  Serial.println("");
+  Serial.print("IR at 10cm = ");  Serial.print(ir_cal_min);
+  Serial.print(" / IR at 25cm = "); Serial.println(ir_cal_max);
+  if (apply_calibration()) {
+    save_calibration();
+    Serial.println("calibration saved (kept after power off)");
+  } else {
+    Serial.println("not saved: IR at 10cm must be larger than IR at 25cm by 50 or more");
+  }
+  print_hold_until = millis() + 3000;
+}
+
+void handle_serial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '1') {
+      ir_cal_min = measure_ir();
+      report_calibration();
+    } else if (c == '2') {
+      ir_cal_max = measure_ir();
+      report_calibration();
+    } else if (c == 'r' || c == 'R') {
+      ir_cal_min = _IR_AT_DIST_MIN;
+      ir_cal_max = _IR_AT_DIST_MAX;
+      EEPROM.put(EEPROM_ADDR, (int)0);
+      apply_calibration();
+      Serial.println("");
+      Serial.println("calibration reset to default");
+      print_hold_until = millis() + 3000;
+    }
+  }
+}
+
+void setup() {
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LED_OFF);
+
+  myservo.attach(PIN_SERVO, 500, 2500);
+  myservo.writeMicroseconds(_DUTY_MIN);
+
+  load_calibration();
+
+  Serial.begin(1000000);
+
+  last_sampling_time = millis();
+}
+
+void loop() {
+  int a_value;
+  float dist_raw, dist_filtered;
+  float duty;
+
+  handle_serial();
+
+  // wait until next sampling time
+  if (millis() - last_sampling_time < INTERVAL)
+    return;
+  last_sampling_time += INTERVAL;
+
+  // read IR sensor and convert to distance (unit: mm)
+  a_value = analogRead(PIN_IR);
+  if (a_value <= 9) {
+    dist_raw = 999.0;   // no reflection: treat as very far
+  } else {
+    dist_raw = ir_to_dist(a_value);
+    // two-point calibration: IR at 10cm -> 100mm, IR at 25cm -> 250mm
+    dist_raw = _DIST_MIN + (dist_raw - dist_cal_min) * (_DIST_MAX - _DIST_MIN) / (dist_cal_max - dist_cal_min);
+  }
+
+  // range filter: clamp out-of-range values to the boundary
+  if (dist_raw < _DIST_MIN) {
+    dist_filtered = _DIST_MIN;
+    digitalWrite(PIN_LED, LED_OFF);
+  } else if (dist_raw > _DIST_MAX) {
+    dist_filtered = _DIST_MAX;
+    digitalWrite(PIN_LED, LED_OFF);
+  } else {
+    dist_filtered = dist_raw;
+    digitalWrite(PIN_LED, LED_ON);
+  }
+
+  // EMA filter
+  dist_ema = _EMA_ALPHA * dist_filtered + (1 - _EMA_ALPHA) * dist_ema;
+
+  // servo control: 100mm -> 0 deg, 250mm -> 180 deg (without map())
+  if (dist_ema <= _DIST_MIN)
+    duty = _DUTY_MIN;
+  else if (dist_ema >= _DIST_MAX)
+    duty = _DUTY_MAX;
+  else
+    duty = _DUTY_MIN + (dist_ema - _DIST_MIN) * (_DUTY_MAX - _DUTY_MIN) / (_DIST_MAX - _DIST_MIN);
+  myservo.writeMicroseconds((int)(duty + 0.5));
+
+  // output to the serial port (for serial plotter)
+  if (millis() < print_hold_until)
+    return;
+  Serial.print("_DUTY_MIN:");  Serial.print(_DUTY_MIN);
+  Serial.print(",_DIST_MIN:"); Serial.print(_DIST_MIN);
+  Serial.print(",IR:");        Serial.print(a_value);
+  Serial.print(",dist_raw:");  Serial.print(dist_raw);
+  Serial.print(",ema:");       Serial.print(dist_ema);
+  Serial.print(",servo:");     Serial.print(duty);
+  Serial.print(",_DIST_MAX:"); Serial.print(_DIST_MAX);
+  Serial.print(",_DUTY_MAX:"); Serial.print(_DUTY_MAX);
+  Serial.println("");
+}
